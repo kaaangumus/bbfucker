@@ -178,13 +178,18 @@ return []string{}
 tmpFFUFOut.Close()
 defer os.Remove(tmpFFUFOut.Name())
 
+// ffuf için bağımsız 2 dakika timeout — pipeline context'ten ayrı
+ffufCtx, ffufCancel := context.WithTimeout(ctx, 120*time.Second)
+defer ffufCancel()
+
 args := []string{
 "-u", target,
 "-H", fmt.Sprintf("Host: FUZZ.%s", domain),
 "-w", wordlist,
 "-mc", "200,301,302,403",
-"-t", "30",   // 50→30: sunucuyu bunaltma
-"-timeout", "10",
+"-t", "20",        // thread sayısı
+"-timeout", "8",  // per-request timeout (saniye)
+"-maxtime", "110", // toplam çalışma süresi (saniye) — context'ten 10s önce dur
 "-s",
 "-o", tmpFFUFOut.Name(),
 "-of", "json",
@@ -197,9 +202,15 @@ args = append(args, "-fs", strconv.FormatInt(baseSize, 10))
 args = append(args, "--calibrate")
 }
 
-cmd := exec.CommandContext(ctx, "ffuf", args...)
+cmd := exec.CommandContext(ffufCtx, "ffuf", args...)
+cmd.Stdout = nil // terminal'e basmasın
+cmd.Stderr = nil
 if err := cmd.Run(); err != nil {
-logger.Debugf("ffuf vhost discovery başarısız: %v", err)
+if ffufCtx.Err() != nil {
+	color.Yellow("  [!] ffuf 2 dakika limitine ulaştı — devam ediliyor")
+} else {
+	logger.Debugf("ffuf vhost discovery başarısız: %v", err)
+}
 return []string{}
 }
 
@@ -258,36 +269,45 @@ color.Cyan("  [>] Nmap SYN stealth modu aktif (-sS)")
 color.Cyan("  [>] Nmap TCP connect modu (-sT, root yok)")
 }
 
-// Toplu tarama: tüm hostları tek komuta ver
+// Nmap için bağımsız timeout: host başına 30s, max 10 dakika
+nmapTimeout := time.Duration(len(hosts)) * 30 * time.Second
+if nmapTimeout > 10*time.Minute {
+	nmapTimeout = 10 * time.Minute
+}
+nmapCtx, nmapCancel := context.WithTimeout(ctx, nmapTimeout)
+defer nmapCancel()
+
 args := []string{
 scanType,
-"-T2",        // yavaş, IDS tetiklemez
-"--open",     // sadece açık portlar
+"-T3",        // T2 çok yavaş — T3 dengeli
+"--open",
 "-p", webPorts,
-"-sV",                     // servis/versiyon tespiti
-"--version-intensity", "3", // hafif (-sV full = 9, çok yavaş)
-"--host-timeout", "3m",
+"-sV",
+"--version-intensity", "3",
+"--host-timeout", "30s", // host başına max 30 saniye
 "--max-retries", "1",
-"-oG", "-",   // grep-able output, stdout'a
+"-oG", "-",
 }
 args = append(args, hosts...)
 
-color.Cyan("  [>] %d host taranıyor, portlar: %s", len(hosts), webPorts)
+color.Cyan("  [>] %d host taranıyor, portlar: %s (max %s)", len(hosts), webPorts, nmapTimeout.Round(time.Second))
 
-cmd := exec.CommandContext(ctx, "nmap", args...)
+cmd := exec.CommandContext(nmapCtx, "nmap", args...)
 var stdout bytes.Buffer
 var stderr bytes.Buffer
 cmd.Stdout = &stdout
 cmd.Stderr = &stderr
 
-// Nmap birden fazla host için uzun sürebilir — context timeout'u izle
 if err := cmd.Run(); err != nil {
-// context iptal veya nmap hatası — stderr'e bak
-if ctx.Err() != nil {
-color.Yellow("  [!] Nmap taraması zaman aşımına uğradı")
+if nmapCtx.Err() != nil {
+	color.Yellow("  [!] Nmap taraması zaman aşımına uğradı (%s) — kısmi sonuçlar değerlendiriliyor", nmapTimeout.Round(time.Second))
 } else {
-logger.Debugf("nmap hatası: %v — %s", err, strings.TrimSpace(stderr.String()))
-color.Yellow("  [!] Nmap hata verdi (root gerekebilir -sS için): %v", err)
+	logger.Debugf("nmap hatası: %v — %s", err, strings.TrimSpace(stderr.String()))
+	color.Yellow("  [!] Nmap hata verdi: %v", err)
+}
+// Zaman aşımında bile kısmi çıktıyı değerlendir
+if stdout.Len() > 0 {
+	return p.parseNmapGrepable(stdout.String())
 }
 return nil
 }
