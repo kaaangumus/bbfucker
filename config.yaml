@@ -1,0 +1,656 @@
+# ============================================================================
+# BB FUCKER - 6-Phase Professional Bug Bounty Recon Pipeline
+# Based on Advanced Methodology: https://github.com/BugBounty-Recon-Methodology
+# ============================================================================
+#
+# PLATFORM: Linux (Kali/Ubuntu/Debian) - Optimized for Linux!
+# 
+# External tools (wafw00f, wpscan, whatweb, sqlmap, nmap) require Linux apt-get
+# Wordlist paths (/usr/share/seclists) are Linux-specific
+# For Windows/macOS: Use WSL or manual tool installation
+#
+# ============================================================================
+
+# Global Settings
+settings:
+  max_workers: 20           # Go concurrency (100 çok agresif — WAF/IDS tetikler)
+  timeout: 10               # Request timeout (seconds)
+  retry_attempts: 2
+  deep_scan: false
+  user_agent: "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+  resolvers: "resolvers.txt" # DNS resolver list
+
+# ============================================================================
+# PHASE 1: PASSIVE INTELLIGENCE & SCOPE MAPPING
+# ============================================================================
+phase1_passive:
+  enabled: true
+  
+  # ASN & Network Mapping
+  asn_discovery:
+    enabled: true
+    tools:
+      - asnmap      # ASN enumeration
+      - whois       # IP range extraction
+      - mapcidr     # CIDR to IP expansion
+      - dnsx        # DNS resolution validation
+    
+    # IP Extraction from 3rd Party APIs
+    api_providers:
+      urlscan:
+        enabled: true
+        api_url: "https://urlscan.io/api/v1/search/?q=domain:{domain}&size=10000"
+      virustotal:
+        enabled: true
+        api_key: ""  # Add your VT API key
+        api_url: "https://www.virustotal.com/vtapi/v2/domain/report"
+      c99:
+        enabled: false
+        scan_url: "https://subdomainfinder.c99.nl/scans/"
+  
+  # Passive Subdomain Enumeration (11+ tools)
+  subdomain_enum:
+    enabled: true
+    tools:
+      subfinder:
+        enabled: true
+        all_sources: true
+        recursive: true
+      amass:
+        enabled: true
+        passive: true
+        no_recursive: true
+        no_alts: true
+      findomain:
+        enabled: true
+      assetfinder:
+        enabled: true
+        subs_only: true
+      chaos:
+        enabled: true
+      github_subdomain:
+        enabled: true
+      subdog:
+        enabled: true
+      tldfinder:
+        enabled: true
+      bbot:
+        enabled: false
+        flags: "-f subdomain-enum"
+      oneforall:
+        enabled: false
+        no_brute: true
+    
+    # Certificate & API Scraping
+    sources:
+      crtsh:
+        enabled: true
+        api_url: "https://crt.sh/?q=%25.{domain}&output=json"
+      securitytrails:
+        enabled: true
+        api_key: ""  # Add your SecurityTrails API key
+        api_url: "https://api.securitytrails.com/v1/domain/{domain}/subdomains"
+      hackertarget: true
+      threatcrowd: true
+      alienvault: true
+      wayback: true
+      virustotal: true
+      urlscan: true
+
+# ============================================================================
+# PHASE 2: DNS RESOLUTION & BRUTE-FORCING
+# ============================================================================
+phase2_dns:
+  enabled: true
+  
+  # Filtering & Unique Subdomains
+  filtering:
+    enabled: true
+    tool: anew           # Fast unique filtering
+    merge_all: true      # Merge all phase1 results
+  
+  # DNS Resolution with Puredns
+  resolution:
+    enabled: true
+    tool: puredns
+    resolver_file: "resolvers.txt"  # Public DNS resolvers
+    validate: true
+    rate_limit: 500      # Queries per second
+    
+    # Secondary recursive scan
+    recursive_subfinder:
+      enabled: true
+      all_sources: true
+  
+  # DNS Brute-forcing
+  bruteforce:
+    enabled: true
+    tool: puredns
+    wordlist: "dns_wordlist.txt"   # all.txt, subdomains.txt
+    resolver_file: "resolvers.txt"
+    threads: 30              # 100 çok agresif — DNS resolver'lar bloklar
+    wildcards: true      # Wildcard detection
+  
+  # Subdomain Permutations (Go-based + dnsx validation)
+  permutations:
+    enabled: true
+    tool: builtin
+    patterns:
+      - "{word}-{word}"
+      - "{word}.{word}"
+      - "api-{word}"
+      - "dev-{word}"
+      - "{word}-api"
+      - "{word}-dev"
+    pipe_to_dnsx: true   # Validate with DNSx
+
+# ============================================================================
+# PHASE 3: INFRASTRUCTURE & PORT ANALYSIS
+# ============================================================================
+phase3_infrastructure:
+  enabled: true
+  
+  # Port Scanning with Naabu
+  port_scan:
+    enabled: true
+    tool: naabu
+    
+    # Scan modes
+    scan_all_ports: false
+    top_ports: 1000
+    full_port_range: false  # -p - (very slow, 65535 ports)
+    
+    # Performance
+    concurrency: 50          # Port tarama parallelism
+    rate: 300                # Paket/saniye (1000 çok agresif — Cloudflare/IDS tetikler)
+    
+    # Filters
+    exclude_ports: "80,443,21,22,25"  # Skip common ports for speed
+    exclude_cdn: true    # Skip CDN IPs
+    
+    # Output
+    json_output: true
+    
+  # Service Detection with Nmap
+  service_detection:
+    enabled: true
+    tool: nmap
+    options: "-sV -sC"   # Service version + default scripts
+    timing: "-T4"        # Aggressive timing
+    
+    # Naabu-Nmap combo (automated)
+    naabu_nmap_combo:
+      enabled: true
+      naabu_cli: "naabu -list {input} -c 50 -nmap-cli 'nmap -sV -sC' -o {output}"
+  
+  # Virtual Host Discovery
+  vhost_discovery:
+    enabled: true
+    tool: ffuf
+    wordlist: "vhosts.txt"
+    
+    # VHost fuzzing patterns
+    patterns:
+      - "Host: FUZZ.{domain}"
+      - "Host: FUZZ"
+    
+    # Filters
+    filter_size: true    # Filter by response size
+    filter_words: true   # Filter by word count
+    
+  # API Endpoint Fuzzing
+  api_fuzzing:
+    enabled: true
+    tool: ffuf
+    patterns:
+      - "https://FUZZ.api.{domain}"
+      - "https://api.FUZZ.{domain}"
+      - "https://{domain}/api/FUZZ"
+    wordlist: "api_endpoints.txt"
+
+# ============================================================================
+# PHASE 4: WEB PROBING & VULNERABILITY SCANNING
+# ============================================================================
+phase4_web_probing:
+  enabled: true
+  
+  # WPScan API token (opsiyonel — https://wpscan.com/api adresinden ücretsiz alınır)
+  # Token olmadan da çalışır, zafiyet veritabanı kısıtlı olur.
+  wpscan_api_token: ""  # Add your WPScan API token (https://wpscan.com/api)
+  
+  # HTTP Probing with HTTPX
+  http_probe:
+    enabled: true
+    tool: httpx
+    
+    # Output flags
+    status_code: true
+    content_length: true
+    content_type: true
+    line_count: true
+    title: true
+    body_preview: true
+    server: true
+    tech_detect: true        # Technology detection (Wappalyzer)
+    
+    # Probing behavior
+    probe_all_ips: true      # Probe all IPs behind domain
+    follow_redirects: true
+    follow_host_redirects: true
+    include_response: true   # Include full response
+    random_agent: true       # Random User-Agent
+    
+    # Performance
+    threads: 50              # httpx thread sayısı (kod MaxWorkers okur: 20)
+    rate_limit: 50           # Requests per second — WAF tetiklememek için düşük
+    timeout: 10
+    retries: 2
+    
+    # Filters
+    filter_cdn: false
+    match_codes: "200,301,302,401,403"
+    
+  # Nuclei CVE & Misconfiguration Scan
+  nuclei:
+    enabled: true
+    
+    # Templates
+    templates:
+      - "cves/"
+      - "exposures/"
+      - "misconfiguration/"
+      - "vulnerabilities/"
+      - "exposed-panels/"
+      - "takeovers/"
+    
+    # Severity filter
+    severity: "critical,high,medium"
+    
+    # Tags
+    tags: "cve,misconfig,exposed-panel,tech,vuln,default-login,backup,devops,disclosure"
+    
+    # Performance
+    concurrency: 15          # Paralel tarama (kod MaxWorkers/2 okur: 10)
+    rate_limit: 50           # Requests per second
+    timeout: 10
+    retries: 1
+    
+    # Output
+    json_output: true
+    markdown_output: false
+    
+    # Auto-update templates
+    update_templates: true
+  
+  # Subdomain Takeover Detection
+  takeover:
+    enabled: true
+    tools:
+      subjack:
+        enabled: true
+        fingerprints: "default"  # Built-in fingerprints
+        threads: 20
+      subzy:
+        enabled: true
+        targets_file: true
+        concurrency: 10
+
+# ============================================================================
+# PHASE 5: DEEP CONTENT & JAVASCRIPT ANALYSIS
+# ============================================================================
+phase5_content_analysis:
+  enabled: true
+  
+  # URL & Archive Extraction
+  url_extraction:
+    enabled: true
+    
+    # Waymore - Wayback Machine mining
+    waymore:
+      enabled: true
+      mode: "U"              # URL mode
+      input_domain: true
+      output_urls: true
+      limit: 10000
+    
+    # Gau - GetAllURLs (multi-provider)
+    gau:
+      enabled: true
+      providers: "wayback,commoncrawl,otx,urlscan"
+      threads: 5
+      verbose: true
+      include_subdomains: true
+      blacklist: ""          # Extensions to exclude
+    
+    # Katana - JS-aware crawler
+    katana:
+      enabled: true
+      max_depth: 3
+      js_crawl: true
+      crawl_duration: 0      # 0 = unlimited
+      crawl_scope: "host"    # host, strict, yolo
+      
+      # Known files
+      extract_robots: true   # robots.txt
+      extract_sitemap: true  # sitemap.xml
+      
+      # Performance
+      concurrency: 5          # Paralel tarama (Katana için az yeterli)
+      parallelism: 5
+      rate_limit: 30          # Request/saniye — crawl'da agresif olma
+  
+  # Sensitive File Extraction
+  sensitive_files:
+    enabled: true
+    
+    # File patterns to extract
+    extensions:
+      documents: [".xls", ".xlsx", ".doc", ".docx", ".pdf", ".ppt", ".pptx"]
+      data: [".xml", ".json", ".csv", ".yml", ".yaml"]
+      databases: [".sql", ".db", ".sqlite", ".mdb"]
+      backups: [".bak", ".old", ".backup", ".zip", ".tar", ".gz", ".7z", ".rar"]
+      configs: [".config", ".conf", ".cfg", ".ini", ".env"]
+      source: [".log", ".txt", ".swp", ".tmp"]
+    
+    # Grep patterns
+    grep_enabled: true
+    grep_pattern: '\.xls|\.xml|\.xlsx|\.json|\.pdf|\.sql|\.doc|\.zip|\.bak|\.config|\.yaml'
+  
+  # JavaScript Deep Dive
+  javascript:
+    enabled: true
+    
+    # JS File Discovery
+    discovery:
+      getjs:
+        enabled: true
+        complete: true       # --complete flag
+        output_file: true
+      
+      grep_js:
+        enabled: true
+        pattern: '\.js$'
+        httpx_filter: true   # Filter with httpx -mc 200
+    
+    # Endpoint Extraction from JS
+    endpoint_extraction:
+      enabled: true
+      
+      # Regex patterns for endpoint discovery
+      patterns:
+        - '(?<=("|''|`))\/[a-zA-Z0-9_?&=\/\-\#\.]*(?=("|''|`))'
+        - '(?<=(api|API)["\s]*[:=]["\s]*)https?:\/\/[^"\s]+'
+        - '(?<=fetch\()["'']([^"'']+)["'']'
+        - '(?<=axios\.[get|post]+\()["'']([^"'']+)["'']'
+      
+      # Tools
+      tools:
+        - "curl"             # Manual curl + grep
+        - "linkfinder"       # Dedicated JS endpoint tool
+        - "jsluice"          # Modern JS analyzer
+      
+      # Output
+      unique_only: true
+      sort_output: true
+    
+    # Secret & API Key Detection
+    secret_scanning:
+      enabled: true
+      patterns:
+        - 'api[_-]?key'
+        - 'access[_-]?token'
+        - 'secret[_-]?key'
+        - 'aws[_-]?access'
+        - 'database[_-]?url'
+        - 'password'
+        - 'bearer'
+
+# ============================================================================
+# PHASE 6: INPUT & PARAMETER FUZZING
+# ============================================================================
+phase6_parameter_fuzzing:
+  enabled: true
+  
+  # Parameter Discovery with Arjun
+  parameter_discovery:
+    enabled: true
+    tool: arjun
+    
+    # Methods
+    methods: ["GET", "POST"]
+    
+    # Wordlist
+    wordlist: "params.txt"   # Default: built-in
+    
+    # Performance
+    threads: 25
+    delay: 0
+    timeout: 10
+    
+    # Output
+    output_format: "text"    # text, json
+  
+  # GF Patterns (URL filtering)
+  gf_patterns:
+    enabled: true
+    
+    # Available patterns
+    patterns:
+      xss: true              # XSS vulnerable parameters
+      lfi: true              # LFI/Path traversal
+      sqli: true             # SQL injection
+      ssrf: true             # SSRF parameters
+      redirect: true         # Open redirect
+      rce: true              # RCE parameters
+      idor: true             # IDOR patterns
+    
+    # Pipe to qsreplace
+    qsreplace:
+      enabled: true
+      replace_value: "FUZZ"  # Placeholder for fuzzing
+  
+  # XSS Testing Pipeline
+  xss_testing:
+    enabled: true
+    
+    # URL preparation
+    preparation:
+      gf_xss: true           # Filter XSS params with GF
+      uro: true              # URO - URL dedupe
+      gxss: true             # Gxss - XSS parameter detection
+      rxss: true             # Rxss - Reflected XSS detection
+    
+    # Dalfox - Advanced XSS Scanner
+    dalfox:
+      enabled: true
+      mode: "pipe"           # pipe, url, file
+      
+      # Features
+      mining: true           # Parameter mining
+      mining_dict: true      # Use built-in mining dict
+      waf_evasion: true      # WAF evasion her zaman aktif (WAFGuard ile birlikte çalışır)
+      blind_xss: false       # XSS Hunter integration
+
+      # Performance
+      worker: 20             # Paralel worker sayısı
+      delay: 0
+      timeout: 10
+      
+      # Payloads
+      custom_payload: ""
+      custom_alert_value: ""
+      
+      # Output
+      format: "json"
+      silence: false
+  
+  # LFI/Path Traversal Testing
+  lfi_testing:
+    enabled: true
+    
+    # URL preparation
+    preparation:
+      gf_lfi: true           # Filter LFI params
+      qsreplace: true        # Replace with FUZZ
+    
+    # FFUF LFI Fuzzing
+    ffuf:
+      enabled: true
+      wordlist: "lfi_payloads.txt"
+      
+      # Match conditions
+      match_regex: "root:"   # Unix /etc/passwd
+      match_regex2: "\\[extensions\\]"  # Windows boot.ini
+      
+      # Filters
+      filter_size: true
+      filter_lines: true
+      
+      # Performance
+      threads: 40
+      rate: 100
+  
+  # SQLi Testing
+  sqli_testing:
+    enabled: true
+    
+    # URL preparation
+    preparation:
+      gf_sqli: true          # Filter SQLi params
+      qsreplace: true
+    
+    # SQLMap integration (optional)
+    sqlmap:
+      enabled: false
+      level: 1
+      risk: 1
+      threads: 10
+      technique: "BEUSTQ"    # All techniques
+  
+  # Directory & File Fuzzing (FFUF)
+  ffuf:
+    enabled: true
+    
+    # Directory fuzzing
+    directory_fuzzing:
+      enabled: true
+      wordlists:
+        - "raft-large-directories.txt"
+        - "common.txt"
+        - "directory-list-2.3-medium.txt"
+      
+      # URL patterns
+      patterns:
+        - "https://{domain}/FUZZ"
+        - "https://{subdomain}/FUZZ"
+      
+      # Match codes
+      match_codes: "200,204,301,302,307,401,403"
+      
+    # File fuzzing with extensions
+    file_fuzzing:
+      enabled: true
+      extensions: ["php", "asp", "aspx", "jsp", "html", "js", "txt", "zip", "bak", "old", "config", "env"]
+      
+      # URL patterns
+      patterns:
+        - "https://{domain}/FUZZ.{ext}"
+        - "https://{domain}/backup/FUZZ.{ext}"
+        - "https://{domain}/admin/FUZZ.{ext}"
+      
+    # Performance
+    threads: 20              # ffuf thread sayısı (kod max(10,MaxWorkers/2) kullanır)
+    rate: 50                 # Requests per second — WAF koruma eşiğinin altında
+    timeout: 10
+    
+    # Filters
+    filter_size: true
+    filter_lines: true
+    filter_words: true
+    auto_calibrate: true    # -ac flag
+    
+    # Recursion
+    recursion: false
+    recursion_depth: 2
+
+# ============================================================================
+# WORDLISTS & RESOLVERS
+# ============================================================================
+wordlists:
+  dns_bruteforce: "wordlists/dns_wordlist.txt"
+  subdomains: "wordlists/subdomains-top1million-110000.txt"
+  directories: "wordlists/raft-large-directories.txt"
+  common: "wordlists/common.txt"
+  parameters: "wordlists/params.txt"
+  lfi: "wordlists/lfi_payloads.txt"
+  xss: "wordlists/xss_payloads.txt"
+  sqli: "wordlists/sqli_payloads.txt"
+  vhosts: "wordlists/vhosts.txt"
+  api: "wordlists/api_endpoints.txt"
+
+resolvers:
+  file: "resolvers.txt"
+  trusted:
+    - "1.1.1.1"
+    - "8.8.8.8"
+    - "8.8.4.4"
+    - "9.9.9.9"
+
+# ============================================================================
+# VULNERABILITY CHECKS & FILTERS
+# ============================================================================
+vulnerability_checks:
+  # Injection vulnerabilities
+  xss: true
+  sqli: true
+  nosqli: true
+  xmli: true
+  ldapi: true
+  
+  # Server-side vulnerabilities  
+  ssrf: true
+  rce: true
+  lfi: true
+  rfi: true
+  
+  # Access control
+  idor: true
+  open_redirect: true
+  path_traversal: true
+  
+  # Logic flaws
+  xxe: true
+  csrf: true
+  cors: true
+  
+  # Information disclosure
+  sensitive_data: true
+  error_based: true
+
+# ============================================================================
+# OUTPUT & REPORTING
+# ============================================================================
+output:
+  # Report formats
+  save_html_report: true
+  save_json_report: true
+  save_markdown_report: true
+  save_txt_summary: true
+  
+  # Screenshots
+  screenshots: false
+  screenshot_tool: "gowitness"  # gowitness, aquatone
+  
+  # Verbosity
+  verbose: true
+  debug: false
+  
+  # Real-time notifications
+  discord_webhook: ""
+  slack_webhook: ""
+  telegram_bot: ""
+  
+  # Output structure
+  timestamp_dirs: true
+  organize_by_severity: true
+

@@ -1,0 +1,32 @@
+# Build outputs
+bbfucker.exe
+bbfucker
+*.exe
+
+# Go
+*.test
+*.out
+# go.sum takip edilmeli — dependency reproducibility için
+
+# Results
+results/
+*.log
+
+# Config backups
+config.yaml.bak
+*.swp
+*.swo
+
+# Config with secrets — API key'leri doldurmadan önce buraya ekle
+# config.yaml  ← takip ediliyor, içinde boş template değerleri var
+
+# OAuth tokens
+.gemini_token.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
