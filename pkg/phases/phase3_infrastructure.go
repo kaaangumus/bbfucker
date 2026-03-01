@@ -79,16 +79,13 @@ color.Green("[✓] Discovered %d virtual hosts", len(vhosts))
 }
 }
 
-// Step 3.2: Stealth Web Port Scan (Nmap)
-color.Yellow("\n[*] Step 3.2: Stealth Web Port Scan (Nmap)")
-if _, err := exec.LookPath("nmap"); err != nil {
-color.Yellow("  [!] nmap kurulu değil — port scan atlandı")
-color.Yellow("      Kurulum: apt install nmap")
-} else if len(input.ResolvedDomains) > 0 {
-ports := p.nmapStealthWebScan(ctx, input.ResolvedDomains)
-output.OpenPorts = append(output.OpenPorts, ports...)
-// -sV ile gelen servis bilgilerini services.txt için ServiceInfo'ya aktar
-for _, p2 := range ports {
+// Step 3.2: Port Scan (RustScan + Nmap)
+color.Yellow("\n[*] Step 3.2: Port Scan (RustScan → Nmap -sV)")
+if len(input.ResolvedDomains) > 0 {
+	ports := p.rustScanPortScan(ctx, input.ResolvedDomains)
+	output.OpenPorts = append(output.OpenPorts, ports...)
+	// -sV ile gelen servis bilgilerini services.txt için ServiceInfo'ya aktar
+	for _, p2 := range ports {
 	if p2.Service != "" {
 		output.Services = append(output.Services, ServiceInfo{
 			Host:    p2.Host,
@@ -99,7 +96,7 @@ for _, p2 := range ports {
 		})
 	}
 }
-output.Statistics.ToolsUsed = append(output.Statistics.ToolsUsed, "nmap")
+output.Statistics.ToolsUsed = append(output.Statistics.ToolsUsed, "rustscan")
 output.Statistics.Extra["open_ports"] = len(ports)
 output.Statistics.Extra["services"] = len(output.Services)
 if len(output.Services) > 0 {
@@ -246,73 +243,182 @@ return vhosts
 }
 
 // ============================================================================
-// Nmap Stealth Web Port Scan
+// RustScan → Nmap Port Scan
 // ============================================================================
 
 // webPorts — taranacak portlar: yalnızca web uygulamalarında anlamlı portlar
 const webPorts = "80,443,8000,8008,8080,8443,3000,4443,5000,8888,9090,9443,10000"
 
-// nmapStealthWebScan hedef hostlara stealth TCP taraması yapar.
-// Root erişimi varsa -sS (SYN stealth), yoksa -sT (TCP connect) kullanır.
-// -T2 ile yavaş/sessiz çalışır, yalnızca web portları taranır.
-func (p *Phase3Infrastructure) nmapStealthWebScan(ctx context.Context, hosts []string) []PortInfo {
-if len(hosts) == 0 {
-return nil
+// webPortSet — hızlı lookup için port numaraları seti
+var webPortSet = map[int]bool{
+	80: true, 443: true, 8000: true, 8008: true, 8080: true,
+	8443: true, 3000: true, 4443: true, 5000: true, 8888: true,
+	9090: true, 9443: true, 10000: true,
 }
 
-// Root/sudo kontrolü — -sS için gerekli
-scanType := "-sT" // varsayılan: root gerektirmez
-if p.hasRootPrivilege() {
-scanType = "-sS"
-color.Cyan("  [>] Nmap SYN stealth modu aktif (-sS)")
-} else {
-color.Cyan("  [>] Nmap TCP connect modu (-sT, root yok)")
+// rustScanPortScan: RustScan ile hızlı port keşfi, ardından nmap -sV ile servis tespiti.
+// RustScan yoksa doğrudan nmap fallback'e geçer.
+func (p *Phase3Infrastructure) rustScanPortScan(ctx context.Context, hosts []string) []PortInfo {
+	if len(hosts) == 0 {
+		return nil
+	}
+
+	// Timeout: host başına 15s, max 8 dakika
+	scanTimeout := time.Duration(len(hosts)) * 15 * time.Second
+	if scanTimeout > 8*time.Minute {
+		scanTimeout = 8 * time.Minute
+	}
+	scanCtx, scanCancel := context.WithTimeout(ctx, scanTimeout)
+	defer scanCancel()
+
+	// RustScan var mı?
+	haveRustScan := false
+	if _, err := exec.LookPath("rustscan"); err == nil {
+		haveRustScan = true
+	}
+	haveNmap := false
+	if _, err := exec.LookPath("nmap"); err == nil {
+		haveNmap = true
+	}
+
+	if !haveRustScan && !haveNmap {
+		color.Yellow("  [!] rustscan ve nmap bulunamadı — port scan atlandı")
+		color.Yellow("      RustScan: https://github.com/RustScan/RustScan/releases")
+		color.Yellow("      Nmap: apt install nmap")
+		return nil
+	}
+
+	var openPorts []PortInfo // rustscan'dan gelen ham sonuçlar
+
+	// ── Adım 1: RustScan ile hızlı port keşfi ─────────────────────────────────
+	if haveRustScan {
+		color.Cyan("  [>] RustScan: %d host, portlar: %s (max %s)", len(hosts), webPorts, scanTimeout.Round(time.Second))
+
+		rstArgs := []string{
+			"-a", strings.Join(hosts, ","),
+			"-p", webPorts,
+			"--ulimit", "5000",
+			"--timeout", "2000", // ms cinsinden per-port connect timeout
+			"--tries", "1",
+			"-g",              // greppable: "1.2.3.4 -> [80, 443]"
+		}
+
+		var rstOut bytes.Buffer
+		cmd := exec.CommandContext(scanCtx, "rustscan", rstArgs...)
+		cmd.Stdout = &rstOut
+		cmd.Stderr = nil
+
+		if err := cmd.Run(); err != nil && scanCtx.Err() == nil {
+			logger.Debugf("rustscan hatası: %v", err)
+			color.Yellow("  [!] RustScan başarısız — nmap fallback")
+			haveRustScan = false
+		} else {
+			openPorts = p.parseRustScanGreppable(rstOut.String())
+			color.Green("  [✓] RustScan: %d açık web portu bulundu", len(openPorts))
+		}
+	}
+
+	// ── Adım 2: Nmap -sV ile servis tespiti ───────────────────────────────────
+	if haveNmap && len(openPorts) > 0 {
+		// Rustscan'ın bulduğu host:port çiftlerine özel nmap taraması
+		// Her host için açık portları grupla
+		hostPorts := map[string][]string{}
+		for _, pi := range openPorts {
+			hostPorts[pi.Host] = append(hostPorts[pi.Host], strconv.Itoa(pi.Port))
+		}
+		var enriched []PortInfo
+		for host, ports := range hostPorts {
+			nmapCtx, nmapCancel := context.WithTimeout(ctx, 60*time.Second)
+			args := []string{
+				"-sT",
+				"--open",
+				"-p", strings.Join(ports, ","),
+				"-sV", "--version-intensity", "3",
+				"--host-timeout", "55s",
+				"--max-retries", "1",
+				"-oG", "-",
+				host,
+			}
+			if p.hasRootPrivilege() {
+				args[0] = "-sS"
+			}
+			var out bytes.Buffer
+			nmapCmd := exec.CommandContext(nmapCtx, "nmap", args...)
+			nmapCmd.Stdout = &out
+			nmapCmd.Stderr = nil
+			_ = nmapCmd.Run()
+			nmapCancel()
+			if out.Len() > 0 {
+				enriched = append(enriched, p.parseNmapGrepable(out.String())...)
+			}
+		}
+		if len(enriched) > 0 {
+			color.Green("  [✓] Nmap -sV: %d port için servis tespiti tamamlandı", len(enriched))
+			return enriched
+		}
+	} else if haveNmap && !haveRustScan {
+		// RustScan yok — nmap ile doğrudan tara
+		color.Cyan("  [>] Nmap fallback: %d host (max %s)", len(hosts), scanTimeout.Round(time.Second))
+		scanType := "-sT"
+		if p.hasRootPrivilege() {
+			scanType = "-sS"
+		}
+		nmapArgs := []string{
+			scanType, "-T3", "--open",
+			"-p", webPorts,
+			"-sV", "--version-intensity", "3",
+			"--host-timeout", "30s",
+			"--max-retries", "1",
+			"-oG", "-",
+		}
+		nmapArgs = append(nmapArgs, hosts...)
+		var out bytes.Buffer
+		nmapCmd := exec.CommandContext(scanCtx, "nmap", nmapArgs...)
+		nmapCmd.Stdout = &out
+		nmapCmd.Stderr = nil
+		_ = nmapCmd.Run()
+		if out.Len() > 0 {
+			return p.parseNmapGrepable(out.String())
+		}
+	}
+
+	return openPorts
 }
 
-// Nmap için bağımsız timeout: host başına 30s, max 10 dakika
-nmapTimeout := time.Duration(len(hosts)) * 30 * time.Second
-if nmapTimeout > 10*time.Minute {
-	nmapTimeout = 10 * time.Minute
-}
-nmapCtx, nmapCancel := context.WithTimeout(ctx, nmapTimeout)
-defer nmapCancel()
-
-args := []string{
-scanType,
-"-T3",        // T2 çok yavaş — T3 dengeli
-"--open",
-"-p", webPorts,
-"-sV",
-"--version-intensity", "3",
-"--host-timeout", "30s", // host başına max 30 saniye
-"--max-retries", "1",
-"-oG", "-",
-}
-args = append(args, hosts...)
-
-color.Cyan("  [>] %d host taranıyor, portlar: %s (max %s)", len(hosts), webPorts, nmapTimeout.Round(time.Second))
-
-cmd := exec.CommandContext(nmapCtx, "nmap", args...)
-var stdout bytes.Buffer
-var stderr bytes.Buffer
-cmd.Stdout = &stdout
-cmd.Stderr = &stderr
-
-if err := cmd.Run(); err != nil {
-if nmapCtx.Err() != nil {
-	color.Yellow("  [!] Nmap taraması zaman aşımına uğradı (%s) — kısmi sonuçlar değerlendiriliyor", nmapTimeout.Round(time.Second))
-} else {
-	logger.Debugf("nmap hatası: %v — %s", err, strings.TrimSpace(stderr.String()))
-	color.Yellow("  [!] Nmap hata verdi: %v", err)
-}
-// Zaman aşımında bile kısmi çıktıyı değerlendir
-if stdout.Len() > 0 {
-	return p.parseNmapGrepable(stdout.String())
-}
-return nil
-}
-
-return p.parseNmapGrepable(stdout.String())
+// parseRustScanGreppable rustscan -g çıktısını parse eder.
+// Örnek: "1.2.3.4 -> [80, 443, 8080]"
+func (p *Phase3Infrastructure) parseRustScanGreppable(output string) []PortInfo {
+	var ports []PortInfo
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// "host -> [port, port, ...]"
+		arrow := strings.Index(line, " -> [")
+		if arrow == -1 {
+			continue
+		}
+		host := strings.TrimSpace(line[:arrow])
+		portsPart := strings.Trim(line[arrow+5:], "]")
+		for _, ps := range strings.Split(portsPart, ",") {
+			ps = strings.TrimSpace(ps)
+			portNum, err := strconv.Atoi(ps)
+			if err != nil {
+				continue
+			}
+			if !webPortSet[portNum] {
+				continue // web portu değilse atla
+			}
+			ports = append(ports, PortInfo{
+				Host:  host,
+				Port:  portNum,
+				State: "open",
+			})
+			if p.cfg.Output.Verbose {
+				color.Green("  [+] %s:%d (open)", host, portNum)
+			}
+		}
+	}
+	return ports
 }
 
 // parseNmapServices — nmapStealthWebScan ile aynı çıktıdan ServiceInfo listesi üretir
@@ -483,8 +589,9 @@ return
 color.Yellow("  [i] Altyapı tarama araçları kontrol ediliyor...")
 
 tools := []struct{ bin, install string }{
+{"rustscan", "https://github.com/RustScan/RustScan/releases"},
 {"ffuf", "go install github.com/ffuf/ffuf/v2@latest"},
-{"nmap", "apt install nmap"},
+{"nmap", "apt install nmap (opsiyonel, servis tespiti için)"},
 }
 for _, t := range tools {
 if _, err := exec.LookPath(t.bin); err != nil {

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"bbfucker/pkg/config"
 	"bbfucker/pkg/logger"
@@ -70,12 +71,27 @@ func (s *Scanner) runNuclei(ctx context.Context, targets []string, tags []string
 		return nil
 	}
 
+	// Pipeline ctx iptal edilmiş olsa bile (ör: önceki araç Ctrl+C ile durduruldu)
+	// nuclei kendi bağımsız context'i ile çalışır.
+	// Timeout: hedef başına 20s, normal max 30dk, stealth max 60dk.
+	nucleiTimeout := time.Duration(len(targets)) * 20 * time.Second
+	maxTimeout := 30 * time.Minute
+	if stealth {
+		nucleiTimeout = time.Duration(len(targets)) * 40 * time.Second
+		maxTimeout = 60 * time.Minute
+	}
+	if nucleiTimeout > maxTimeout {
+		nucleiTimeout = maxTimeout
+	}
+	nucleiCtx, nucleiCancel := context.WithTimeout(context.Background(), nucleiTimeout)
+	defer nucleiCancel()
+
 	if s.verbose {
 		mode := "normal"
 		if stealth {
 			mode = "stealth"
 		}
-		color.Cyan("[*] Nuclei taraması başlatılıyor (%d hedef, tags=%v, mod=%s)...", len(targets), tags, mode)
+		color.Cyan("[*] Nuclei taraması başlatılıyor (%d hedef, tags=%v, mod=%s, timeout=%s)...", len(targets), tags, mode, nucleiTimeout.Round(time.Second))
 	}
 
 	// Hedefleri temp dosyaya yaz (stdin yerine — daha güvenilir)
@@ -114,7 +130,7 @@ func (s *Scanner) runNuclei(ctx context.Context, targets []string, tags []string
 		args = append(args, "-rate-limit", "15")
 	}
 
-	cmd := exec.CommandContext(ctx, "nuclei", args...)
+	cmd := exec.CommandContext(nucleiCtx, "nuclei", args...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
