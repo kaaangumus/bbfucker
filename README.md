@@ -47,6 +47,10 @@ go install github.com/tomnomnom/assetfinder@latest
 
 # Sistem araçları
 sudo apt install nmap wafw00f whatweb wpscan sqlmap -y
+
+# RustScan (port tarayıcı)
+curl -sLo /tmp/rustscan.deb https://github.com/RustScan/RustScan/releases/latest/download/rustscan_amd64.deb
+sudo dpkg -i /tmp/rustscan.deb
 ```
 
 ---
@@ -89,7 +93,7 @@ Phase 2 — DNS Resolution & Brute-force
 
 Phase 3 — Infrastructure
   ffuf vhost discovery (baseline calibration ile false-positive onleme)
-  nmap -sT/-sS -sV -T2 stealth web port scan
+  rustscan hızlı port taraması → nmap -sV servis tespiti (sadece açık portlara)
 
 Phase 4 — Web Probing
   httpx probing → Go HTTP fallback

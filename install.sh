@@ -332,6 +332,32 @@ install_go_tool "Naabu" "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
 install_go_tool "HTTPx" "github.com/projectdiscovery/httpx/cmd/httpx@latest"
 install_go_tool "FFUF"  "github.com/ffuf/ffuf/v2@latest"
 
+# RustScan — ana port tarayıcı
+if command -v rustscan &>/dev/null; then
+    echo -e "${GREEN}[✓] RustScan zaten kurulu: $(rustscan --version 2>/dev/null | head -1)${NC}"
+else
+    echo -e "${CYAN}[*] RustScan kuruluyor...${NC}"
+    ARCH=$(uname -m)
+    RS_URL=""
+    if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+        RS_URL="https://github.com/RustScan/RustScan/releases/latest/download/rustscan_amd64.deb"
+    elif [ "$ARCH" = "aarch64" ]; then
+        RS_URL="https://github.com/RustScan/RustScan/releases/latest/download/rustscan_arm64.deb"
+    fi
+    if [ -n "$RS_URL" ]; then
+        if curl -sLo /tmp/rustscan.deb "$RS_URL" 2>/dev/null; then
+            dpkg -i /tmp/rustscan.deb 2>/dev/null && \
+                echo -e "${GREEN}[✓] RustScan kuruldu${NC}" || \
+                echo -e "${YELLOW}[!] RustScan deb kurulum başarısız — cargo ile dene: cargo install rustscan${NC}"
+            rm -f /tmp/rustscan.deb
+        else
+            echo -e "${YELLOW}[!] RustScan indirilemedi — cargo install rustscan${NC}"
+        fi
+    else
+        echo -e "${YELLOW}[!] RustScan: desteklenmeyen mimari ($ARCH) — cargo install rustscan${NC}"
+    fi
+fi
+
 # ─── Phase 4: Web Probing & Vuln Scan ────────────────────────────────────────
 echo ""
 echo -e "${BOLD}--- Phase 4: Web Probing & Vuln Scan ---${NC}"
@@ -657,7 +683,8 @@ check_tool "Anew          (dedup utility)"       anew        "go install anew"
 
 echo ""
 echo -e "${BOLD}Phase 3 — Infrastructure:${NC}"
-check_tool "Naabu         (port scan)"           naabu       "go install naabu"
+check_tool "RustScan      (port scan)"           rustscan    "https://github.com/RustScan/RustScan/releases"
+check_tool "Naabu         (port scan fallback)"  naabu       "go install naabu"
 check_tool "Nmap          (service detect)"      nmap        "apt install nmap"
 check_tool "HTTPx         (web probe)"           httpx       "go install httpx"
 check_tool "FFUF          (dir fuzzing)"         ffuf        "go install ffuf"
@@ -694,13 +721,13 @@ echo ""
 
 ALL_TOOLS=("subfinder" "asnmap" "assetfinder" "amass" "findomain" "whois"
            "puredns" "dnsx" "anew"
-           "naabu" "nmap" "httpx" "ffuf"
+           "rustscan" "naabu" "nmap" "httpx" "ffuf"
            "nuclei" "subzy" "wafw00f" "whatweb" "wpscan" "notify"
            "katana" "gau" "waymore"
            "dalfox" "gf" "qsreplace" "sqlmap"
            "gowitness" "aquatone")
 
-CRITICAL_TOOLS=("subfinder" "dnsx" "httpx" "naabu" "nuclei" "katana" "gau" "ffuf" "dalfox" "gf")
+CRITICAL_TOOLS=("subfinder" "dnsx" "httpx" "rustscan" "nuclei" "katana" "gau" "ffuf" "dalfox" "gf")
 
 working=0
 total=${#ALL_TOOLS[@]}
